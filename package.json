@@ -1,0 +1,33 @@
+{
+  "name": "firefly-cli",
+  "version": "0.1.0",
+  "description": "A gh-style command-line client for the Firefly III personal-finance API",
+  "license": "MIT",
+  "author": "Hugo Jeller Ferreira",
+  "type": "module",
+  "module": "src/cli.ts",
+  "bin": {
+    "firefly": "dist/firefly"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "build": "bun build ./src/cli.ts --compile --minify --outfile dist/firefly",
+    "build:all": "bun run scripts/build-all.ts",
+    "test": "bun test",
+    "coverage-gate": "bun run scripts/coverage-gate.ts",
+    "lint": "biome check src test",
+    "lint:fix": "biome check --write src test",
+    "format": "biome format --write src test",
+    "typegen": "openapi-typescript reference/firefly-iii-v6.6.2-v1.yaml -o src/api/generated/firefly.d.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "latest",
+    "openapi-typescript": "^7.4.4",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "commander": "^13.0.0",
+    "yaml": "^2.6.1"
+  }
+}

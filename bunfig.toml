@@ -1,0 +1,3 @@
+[test]
+# Test files live under test/ and are named *.test.ts
+root = "."
