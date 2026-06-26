@@ -14,21 +14,44 @@ firefly transaction <verb> [target] [flags]
 ## Subcommands
 | Verb | Purpose | Key flags | Interactive? |
 |---|---|---|---|
-| `list` | list transactions | `--type --start --end --account --category --budget --tag --limit --page --all` | no |
+| `list` | list transactions | `--query --type --start --end --account --account-name --category --budget --tag --group-by --sum --count --limit --page --all` | no |
 | `view <id>` | show one group + its splits | `--json` | no |
 | `create` | create a transaction | `--type --amount --description --source --destination --date --category --budget --tag --split --editor` | yes |
-| `edit <id>` | update a transaction | same as create (changed fields only) `--editor` | yes |
+| `edit [ids...]` | update one or many transactions | same as create (changed fields only), `--editor`, `--journal`, `--where <query>`, `--stdin`, `--concurrency` | yes (single) / confirm (bulk) |
+| `categorize <query> <category>` | bulk-set a category on every match of a query | `--concurrency` | confirm |
 | `delete <id>` | delete a transaction | `--yes` | confirm |
 | `attach <id> <file>` | attach a file | — | no |
 | `events <id>` | piggy-bank events caused by this txn | — | no |
 
+### Discovery, selection & aggregation
+- **`list --query <dsl>`** routes to `GET /search/transactions`, so the search DSL is reachable
+  from `list` (not a separate "secret language"). `--help` prints the operator cheatsheet.
+- **`list --account-name "<name>"`** resolves the name → id via `GET /search/accounts` (an extra
+  hop the user would otherwise do by hand), then scopes as `--account` does.
+- **`list --group-by category|account|payee|month|day-of-week [--sum] [--count]`** rolls the
+  fetched rows up **client-side** into an aggregate table (the API only offers fixed insight
+  pivots). `payee` = the non-asset side of each split.
+- A `--all` with no server-side filter prints a one-line stderr tip pointing at `search`.
+
+### Bulk edit (selection × one partial edit)
+`edit` takes a target set from exactly one of: explicit `[ids...]`, `--where <query>` (resolved via
+`GET /search/transactions`), or `--stdin` (whitespace/newline-separated ids). The changed-field
+flags build a single partial split applied to every target via batched PUTs (`--concurrency`,
+default 8), printing progress and a final `N updated, M failed` line (non-zero exit on any
+failure). `--editor` stays single-target only. `categorize` is the focused shortcut for the most
+common case (`--where <query> --category <cat>`).
+
+For a *field-equality* bulk update on the server, see `data bulk` (`meta.md`) — but it cannot
+select by the search DSL.
+
 ## Endpoint mapping
 | Subcommand | API |
 |---|---|
-| list | `GET /transactions` (+ scoped `GET /accounts/{id}/transactions`, `/categories/{id}/transactions`, `/budgets/{id}/transactions`, `/tags/{tag}/transactions`, `/currencies/{code}/transactions` when filtered) |
+| list | `GET /transactions` (+ scoped `GET /accounts/{id}/transactions`, `/categories/{id}/transactions`, `/budgets/{id}/transactions`, `/tags/{tag}/transactions`, `/currencies/{code}/transactions` when filtered; `GET /search/transactions` with `--query`) |
 | view | `GET /transactions/{id}` (or `GET /transaction-journals/{id}` with `--journal`) |
 | create | `POST /transactions` |
-| edit | `PUT /transactions/{id}` |
+| edit | `PUT /transactions/{id}` per target (bulk: one PUT each, batched). `--journal` resolves the group via `GET /transaction-journals/{id}` then PUTs the group with the split keyed by `transaction_journal_id`. `--where` selects via `GET /search/transactions` |
+| categorize | `GET /search/transactions` then a PUT per match |
 | delete | `DELETE /transactions/{id}` (or `DELETE /transaction-journals/{id}` with `--journal`) |
 | attach | `POST /attachments` then `POST /attachments/{id}/upload` (see `attachment.md`) |
 | events | `GET /transactions/{id}/piggy-bank-events` |
@@ -74,6 +97,13 @@ firefly tx create --type withdrawal --amount 12.50 --description Coffee \
   --source Checking --destination "Coffee Shop" --category Food
 
 firefly tx list --type withdrawal --start -30d --json id,description,amount | jq .
+firefly tx list --query 'has_no_category:true' --all
+firefly tx list --start 2026-01-01 --end 2026-06-30 --all --group-by payee --sum
+
+firefly tx categorize 'description_contains:"Eden Beer"' "Nights out"
+firefly tx edit 2103 2104 2105 --category Groceries --yes
+firefly tx edit --where 'category_is:"Misc"' --tag review --yes
+firefly tx edit 9 --journal --category Food      # edit one split in a multi-split group
 
 firefly tx create --editor          # multi-split via YAML
 firefly tx delete 4821 --yes
@@ -81,4 +111,7 @@ firefly tx delete 4821 --yes
 
 ## Notes
 - `view`/`delete --journal` operate on a single split journal id vs the whole group id.
+  `edit --journal` does too: it PUTs the parent group with the split keyed by its
+  `transaction_journal_id`, so per-split category edits in multi-split groups are possible.
+- Bulk `edit`/`categorize` require `--yes` (or a TTY confirm) since they touch many rows.
 - Validation errors (422) surface per-field (`05`).

@@ -165,10 +165,49 @@ $ firefly insight expense category --start 2026-01-01 --end 2026-06-30 --json
 firefly budget limit set 3 --amount 400 --start 2026-06-01 --end 2026-06-30
 ```
 
-**Find large transactions**
+**Find transactions with the search query language**
+
+`search transactions` (and `tx list --query`) accept Firefly III's search DSL. Common operators
+— combine with spaces (AND):
+
+```text
+has_no_category:true        category_is:"Food"            budget_is:"Bills"
+has_any_tag:true            tag_is:"Trip"                 notes_contain:"text"
+amount_more:100             amount_less:50                amount_is:42
+description_contains:"Eden Beer"                          description_is:"Exact"
+date_after:2026-01-01       date_before:2026-12-31        date_on:2026-06-01
+source_account_is:"Checking"            destination_account_is:"Estrelas Motel"
+type:withdrawal             currency_is:EUR
+```
 
 ```sh
-firefly search transactions "amount_more:1000" --limit 10
+firefly search transactions 'amount_more:1000 date_after:2026-01-01'
+firefly tx list --query 'has_no_category:true' --all
+```
+
+**Bulk-categorize everything matching a query** (batched, with a progress + summary line)
+
+```sh
+firefly tx categorize 'has_no_category:true description_contains:"Eden Beer"' "Nights out"
+# ✓ Updated 37 transactions
+
+# or apply any field edit to a selection:
+firefly tx edit --where 'category_is:"Misc"' --category "Groceries" --yes
+echo "2103 2104 2105" | firefly tx edit --stdin --tag "review" --yes
+```
+
+**Group-by roll-ups without leaving the CLI**
+
+```console
+$ firefly tx list --start 2026-01-01 --end 2026-06-30 --all --group-by payee --sum
+payee            count  sum
+Estrelas Motel   12     1840.00
+Eden Beer        9      612.50
+
+$ firefly account spend "Estrelas Motel" --by year
+year  count  sum       avg
+2025  41     6020.00   146.83
+2026  12     1840.00   153.33
 ```
 
 ## Command overview
@@ -180,8 +219,8 @@ verbs and flags. Common aliases in parentheses.
 ### Money / core
 | Command | Verbs |
 |---|---|
-| `transaction` (`tx`) | list, view, create, edit, delete, attach, events — `create --type withdrawal\|deposit\|transfer`, repeatable `--split`, `--editor` |
-| `account` (`acct`) | list, view, create, edit, delete, transactions, balance |
+| `transaction` (`tx`) | list, view, create, edit, delete, categorize, attach, events — `list --query`/`--group-by`/`--account-name`, bulk `edit` (multiple ids, `--where`, `--stdin`, `--journal`), repeatable `--split`, `--editor` |
+| `account` (`acct`) | list, view, create, edit, delete, transactions, balance, spend |
 | `budget` | list, view, create, edit, delete + nested `limit`, `available` |
 | `category` (`cat`) | list, view, create, edit, delete, transactions |
 | `bill` (`subscription`) | list, view, create, edit, delete, transactions, rules |

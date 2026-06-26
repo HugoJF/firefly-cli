@@ -138,3 +138,20 @@ describe('tag', () => {
     expect(parsed).toEqual([{ type: 'withdrawal', count: 1, sum: '7.50', currency: 'USD' }]);
   });
 });
+
+describe('tag name encoding + alias', () => {
+  test('a tag name with a slash is URL-encoded in the path', async () => {
+    const { out, log } = await run(['tag', 'transactions', 'Vintage Culture CG/MS - 2026'], {
+      'GET /v1/tags/': { body: { data: [] } },
+    });
+    expect(log[0].url).toContain('Vintage%20Culture%20CG%2FMS%20-%202026/transactions');
+    expect(out).toBeDefined();
+  });
+
+  test('--name is accepted as an alias for --tag on create', async () => {
+    const { log } = await run(['tag', 'create', '--name', 'roadtrip'], {
+      'POST /v1/tags': { body: { data: { id: '4', attributes: { tag: 'roadtrip' } } } },
+    });
+    expect(JSON.parse(log[0].body as string)).toEqual({ tag: 'roadtrip' });
+  });
+});

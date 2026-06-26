@@ -11,9 +11,16 @@
  * See spec/06-commands/account.md. Alias: `acct`.
  */
 import type { Command } from 'commander';
+import type { FireflyClient } from '../api/client.ts';
 import { UsageError } from '../api/errors.ts';
 import { getContext } from '../context.ts';
-import { printMutation, printResult, renderItem, renderList } from '../output/render.ts';
+import {
+  formatMoney,
+  printMutation,
+  printResult,
+  renderItem,
+  renderList,
+} from '../output/render.ts';
 import { isInteractive, readLine } from '../util/prompt.ts';
 
 const ACCOUNT_TYPES = [
@@ -334,6 +341,86 @@ export function register(program: Command): void {
         ctx.output,
       );
     });
+
+  // ── spend ─────────────────────────────────────────────────────────────────
+  account
+    .command('spend')
+    .description('Summarise spend at an account by name (count / sum / avg)')
+    .argument('<name>', 'Account name (e.g. a payee like "Estrelas Motel"); id also accepted')
+    .option('--start <date>', 'Start date')
+    .option('--end <date>', 'End date')
+    .option('--by <bucket>', 'Break down by year|month')
+    .action(async (name: string, opts, command: Command) => {
+      const ctx = await getContext(command);
+      const client = await ctx.client();
+      const id = /^\d+$/.test(name) ? name : await resolveAccountId(client, name);
+      const { data } = await client.getPaged(`/accounts/${id}/transactions`, {
+        query: { start: toIsoDate(opts.start), end: toIsoDate(opts.end) },
+        all: true,
+      });
+
+      // Flatten to splits; sum absolute amounts (a payee account's spend).
+      const splits = data.flatMap((g: any) => g.attributes?.transactions ?? []);
+      const bucketOf = (s: any): string => {
+        if (opts.by === 'year') {
+          return String(s.date ?? '').slice(0, 4) || '(no date)';
+        }
+        if (opts.by === 'month') {
+          return String(s.date ?? '').slice(0, 7) || '(no date)';
+        }
+        return 'total';
+      };
+      const buckets = new Map<string, { count: number; sum: number; dp: number }>();
+      for (const s of splits) {
+        const key = bucketOf(s);
+        const b = buckets.get(key) ?? { count: 0, sum: 0, dp: 2 };
+        b.count += 1;
+        const amt = Number(s.amount);
+        if (!Number.isNaN(amt)) {
+          b.sum += Math.abs(amt);
+        }
+        if (Number.isFinite(s.currency_decimal_places)) {
+          b.dp = s.currency_decimal_places;
+        }
+        buckets.set(key, b);
+      }
+      const entries = [...buckets.entries()].sort((a, b) =>
+        opts.by ? a[0].localeCompare(b[0]) : 0,
+      );
+      renderList(
+        entries,
+        [
+          { header: opts.by ?? 'period', get: (e) => e[0] },
+          { header: 'count', get: (e) => String(e[1].count) },
+          { header: 'sum', get: (e) => formatMoney(e[1].sum, { decimalPlaces: e[1].dp }) },
+          {
+            header: 'avg',
+            get: (e) =>
+              formatMoney(e[1].count ? e[1].sum / e[1].count : 0, { decimalPlaces: e[1].dp }),
+          },
+        ],
+        ctx.output,
+      );
+    });
+}
+
+/** Resolve an account name to its id via the search endpoint (exact-ish match). */
+async function resolveAccountId(client: FireflyClient, name: string): Promise<string> {
+  const { data } = await client.getPaged('/search/accounts', {
+    query: { query: name, field: 'name' },
+    limit: 50,
+  });
+  const exact = data.find(
+    (a: any) => (a.attributes?.name ?? '').toLowerCase() === name.toLowerCase(),
+  );
+  const hit = exact ?? data[0];
+  if (!hit?.id) {
+    throw new UsageError(
+      `No account matched name "${name}".`,
+      'Check the name or pass the numeric id.',
+    );
+  }
+  return hit.id;
 }
 
 /**

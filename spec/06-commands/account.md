@@ -17,6 +17,11 @@ firefly account <verb> [target] [flags]
 | `delete <id>` | delete account | `--yes` | confirm |
 | `transactions <id>` | transactions for an account | `--type --start --end --limit --all` | no |
 | `balance <id>` | balance/overview chart data | `--start --end` | no |
+| `spend <name>` | count / sum / avg spend at an account (e.g. a payee) | `--start --end --by year\|month` | no |
+
+`list --type expense` (or `revenue`) is the cheap way to enumerate payee accounts. `spend` takes a
+**name** (resolved via `GET /search/accounts`; a numeric argument is used as an id directly) so
+"how much at Estrelas Motel?" is one command instead of an id-lookup hop + client-side maths.
 
 ## Endpoint mapping
 | Subcommand | API |
@@ -28,6 +33,7 @@ firefly account <verb> [target] [flags]
 | delete | `DELETE /accounts/{id}` |
 | transactions | `GET /accounts/{id}/transactions` |
 | balance | `GET /chart/account/overview` filtered to id (see `chart.md`) |
+| spend | `GET /search/accounts` (name → id) then `GET /accounts/{id}/transactions`, aggregated client-side |
 | (piggies) | `GET /accounts/{id}/piggy-banks` surfaced via `piggy list --account` |
 | (attachments) | `GET /accounts/{id}/attachments` via `attachment list --account` |
 

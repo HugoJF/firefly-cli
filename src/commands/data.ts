@@ -32,14 +32,27 @@ export const EXPORT_KINDS = [
   'transactions',
 ] as const;
 
+/** Accumulate repeated `--flag key=value` into an object. */
+function collectKv(raw: string, prev: Record<string, string>): Record<string, string> {
+  const eq = raw.indexOf('=');
+  if (eq === -1) {
+    throw new UsageError(`Invalid entry (expected key=value): ${raw}`);
+  }
+  prev[raw.slice(0, eq).trim()] = raw.slice(eq + 1).trim();
+  return prev;
+}
+
 export function register(program: Command): void {
   const data = program.command('data').description('Bulk, export and destructive data operations');
 
   // ── export ───────────────────────────────────────────────────────────────
   data
     .command('export')
-    .description(`Export data to CSV. kind ∈ ${EXPORT_KINDS.join(', ')}`)
+    .description(
+      `Export data ("pull everything once, analyze locally"). kind ∈ ${EXPORT_KINDS.join(', ')}`,
+    )
     .argument('<kind>', 'What to export')
+    .option('--format <fmt>', 'Output format: csv|json|ndjson (default csv)', 'csv')
     .option('--output <file>', 'Write to a file instead of stdout')
     .option('--start <date>', 'Start date (YYYY-MM-DD)')
     .option('--end <date>', 'End date (YYYY-MM-DD)')
@@ -50,21 +63,38 @@ export function register(program: Command): void {
           `Valid kinds: ${EXPORT_KINDS.join(', ')}`,
         );
       }
+      const format = opts.format as string;
+      if (!['csv', 'json', 'ndjson'].includes(format)) {
+        throw new UsageError(`Invalid --format "${format}".`, 'Valid: csv, json, ndjson.');
+      }
       const ctx = await getContext(command);
       const client = await ctx.client();
-      const query: Query = { type: 'csv' };
-      if (opts.start) {
-        query.start = opts.start;
+
+      let body: string;
+      if (format === 'csv') {
+        const query: Query = { type: 'csv' };
+        if (opts.start) {
+          query.start = opts.start;
+        }
+        if (opts.end) {
+          query.end = opts.end;
+        }
+        const res = await client.get(`/data/export/${kind}`, query);
+        body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+      } else {
+        // json/ndjson: pull the full collection via the list endpoint and serialize.
+        const { data } = await client.getPaged(`/${kind}`, {
+          query: { start: opts.start, end: opts.end },
+          all: true,
+        });
+        body =
+          format === 'ndjson'
+            ? data.map((d) => JSON.stringify(d)).join('\n')
+            : JSON.stringify(data, null, 2);
       }
-      if (opts.end) {
-        query.end = opts.end;
-      }
-      const res = await client.get(`/data/export/${kind}`, query);
-      // CSV bodies come back as text; JSON-ish bodies stringify cleanly too.
-      const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
 
       if (opts.output) {
-        await Bun.write(opts.output, body);
+        await Bun.write(opts.output, body.endsWith('\n') ? body : `${body}\n`);
         printMessage(`Exported ${kind} → ${opts.output}`, ctx.output);
         return;
       }
@@ -72,21 +102,48 @@ export function register(program: Command): void {
     });
 
   // ── bulk ─────────────────────────────────────────────────────────────────
+  //
+  // Firefly's bulk endpoint matches transactions by *field equality* (a `where`
+  // clause), NOT the search DSL. For DSL-based selection (description_contains,
+  // amount_more, …) use `firefly tx categorize <query> <cat>` or
+  // `firefly tx edit --where <query>` instead.
   data
     .command('bulk')
-    .description('Bulk-update transactions by query (POST /data/bulk/transactions)')
-    .requiredOption('--query <json>', 'JSON bulk query (Firefly bulk-update syntax)')
+    .description('Bulk-update transactions by field-equality (POST /data/bulk/transactions)')
+    .option('--query <json>', 'Raw JSON bulk query (escape hatch; Firefly bulk-update syntax)')
+    .option('--where <key=value>', 'Match field equals value (repeatable)', collectKv, {})
+    .option('--set <key=value>', 'Field to update with a new value (repeatable)', collectKv, {})
+    .addHelpText(
+      'after',
+      '\nExamples:\n' +
+        '  firefly data bulk --where category_id=1 --set category_id=5\n' +
+        '  firefly data bulk --query \'{"where":{"category_id":"1"},"update":{"category_id":"5"}}\'\n' +
+        '\nNote: where-clauses are exact field matches. For search-query selection use\n' +
+        "'firefly tx categorize' / 'firefly tx edit --where'.",
+    )
     .action(async (opts, command: Command) => {
-      // Validate it parses; the API expects the raw JSON string as a query param.
-      try {
-        JSON.parse(opts.query);
-      } catch {
-        throw new UsageError('--query must be valid JSON.');
+      let query: string;
+      if (opts.query) {
+        try {
+          JSON.parse(opts.query);
+        } catch {
+          throw new UsageError('--query must be valid JSON.');
+        }
+        query = opts.query;
+      } else {
+        const update = opts.set as Record<string, string>;
+        if (Object.keys(update).length === 0) {
+          throw new UsageError(
+            'Nothing to update.',
+            'Pass --set key=value (and optionally --where key=value), or --query <json>.',
+          );
+        }
+        query = JSON.stringify({ where: opts.where, update });
       }
       const ctx = await getContext(command);
       const client = await ctx.client();
       const res = await client.post('/data/bulk/transactions', undefined, {
-        query: { query: opts.query },
+        query: { query },
       });
       if (ctx.output.mode === 'json' || ctx.output.mode === 'template') {
         printResult(res.data ?? {}, ctx.output);

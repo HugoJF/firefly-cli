@@ -4,6 +4,7 @@
  * Endpoints: /tags[/{tag}[/transactions]].
  */
 import type { Command } from 'commander';
+import { UsageError } from '../api/errors.ts';
 import { getContext } from '../context.ts';
 import { formatMoney, printMutation, renderItem, renderList } from '../output/render.ts';
 
@@ -94,7 +95,8 @@ export function register(program: Command): void {
   tag
     .command('create')
     .description('Create a tag')
-    .requiredOption('--tag <name>', 'Tag name')
+    .option('--tag <name>', 'Tag name')
+    .option('--name <name>', 'Alias for --tag')
     .option('--date <date>', 'Date (YYYY-MM-DD)')
     .option('--description <text>', 'Description')
     .option('--latitude <n>', 'Latitude', numArg)
@@ -103,8 +105,15 @@ export function register(program: Command): void {
     .action(async (opts, command: Command) => {
       const ctx = await getContext(command);
       const client = await ctx.client();
+      // Accept --name as an alias for --tag (a common guess). Only the truly
+      // missing case is a usage error; an explicit empty string still hits the
+      // server's own validation.
+      const tagName = opts.tag ?? opts.name;
+      if (tagName == null) {
+        throw new UsageError('A tag name is required.', 'Pass --tag <name>.');
+      }
       const body = compact({
-        tag: opts.tag,
+        tag: tagName,
         date: opts.date,
         description: opts.description,
         latitude: opts.latitude,
@@ -116,7 +125,7 @@ export function register(program: Command): void {
       printMutation(ctx.output, {
         id: item.id,
         verb: 'Created tag',
-        description: attrs(item).tag ?? opts.tag,
+        description: attrs(item).tag ?? tagName,
       });
     });
 

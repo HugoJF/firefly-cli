@@ -242,3 +242,119 @@ describe('transaction delete', () => {
     expect(log[0].url).toContain('/v1/transaction-journals/7');
   });
 });
+
+describe('transaction list --query / --group-by / --account-name', () => {
+  test('--query routes to /search/transactions', async () => {
+    const log = stub({ 'GET /v1/search/transactions': { body: { data: [group()] } } });
+    const out = await run(['tx', 'list', '--query', 'has_no_category:true']);
+    expect(log[0].url).toContain('/v1/search/transactions');
+    expect(log[0].url).toContain('query=has_no_category');
+    expect(out).toContain('Coffee');
+  });
+
+  test('--group-by category --sum emits an aggregate table', async () => {
+    const rows = {
+      data: [
+        group({ category_name: 'Food', amount: '10' }),
+        group({ category_name: 'Food', amount: '5' }),
+        group({ category_name: 'Fun', amount: '7' }),
+      ],
+    };
+    const log = stub({ 'GET /v1/transactions': { body: rows } });
+    const out = await run(['tx', 'list', '--group-by', 'category', '--sum']);
+    expect(log[0].url).toContain('/v1/transactions');
+    // Food = 2 rows summing 15, sorted first.
+    expect(out).toMatch(/Food\s+2\s+15/);
+    expect(out).toMatch(/Fun\s+1\s+7/);
+  });
+
+  test('--account-name resolves via /search/accounts then scopes', async () => {
+    const log = stub({
+      'GET /v1/search/accounts': {
+        body: { data: [{ id: '38', attributes: { name: 'Estrelas Motel' } }] },
+      },
+      'GET /v1/accounts/38/transactions': { body: { data: [group()] } },
+    });
+    await run(['tx', 'list', '--account-name', 'Estrelas Motel']);
+    expect(log[0].url).toContain('/v1/search/accounts');
+    expect(log[1].url).toContain('/v1/accounts/38/transactions');
+  });
+});
+
+describe('transaction edit (bulk)', () => {
+  test('multiple ids issue one PUT each with the partial split', async () => {
+    const log = stub({ 'PUT /v1/transactions/': { body: { data: group() } } });
+    const out = await run(['tx', 'edit', '101', '102', '103', '--category', 'Food', '--yes']);
+    const puts = log.filter((l) => l.method === 'PUT');
+    expect(puts).toHaveLength(3);
+    expect(JSON.parse(puts[0].body as string).transactions[0]).toMatchObject({
+      category_name: 'Food',
+    });
+    expect(out).toContain('Updated');
+    expect(out).toContain('3 transactions');
+  });
+
+  test('--where searches then edits each match', async () => {
+    const log = stub({
+      'GET /v1/search/transactions': {
+        body: { data: [{ id: '201' }, { id: '202' }] },
+      },
+      'PUT /v1/transactions/': { body: { data: group() } },
+    });
+    await run(['tx', 'edit', '--where', 'has_no_category:true', '--category', 'Rolês', '--yes']);
+    expect(log[0].url).toContain('/v1/search/transactions');
+    const puts = log.filter((l) => l.method === 'PUT');
+    expect(puts).toHaveLength(2);
+  });
+
+  test('--journal resolves the group and keys the split by journal id', async () => {
+    const log = stub({
+      'GET /v1/transaction-journals/9': { body: { data: { id: '55', attributes: {} } } },
+      'PUT /v1/transactions/55': { body: { data: group() } },
+    });
+    await run(['tx', 'edit', '9', '--journal', '--category', 'Food']);
+    expect(log[0].url).toContain('/v1/transaction-journals/9');
+    const put = log.find((l) => l.method === 'PUT');
+    expect(put?.url).toContain('/v1/transactions/55');
+    expect(JSON.parse(put?.body as string).transactions[0]).toMatchObject({
+      transaction_journal_id: '9',
+      category_name: 'Food',
+    });
+  });
+});
+
+describe('transaction categorize', () => {
+  test('searches and bulk-sets the category', async () => {
+    const log = stub({
+      'GET /v1/search/transactions': { body: { data: [{ id: '1' }, { id: '2' }] } },
+      'PUT /v1/transactions/': { body: { data: group() } },
+    });
+    const out = await run([
+      'tx',
+      'categorize',
+      'description_contains:"Eden Beer"',
+      'Rolês',
+      '--yes',
+    ]);
+    expect(log[0].url).toContain('/v1/search/transactions');
+    expect(log.filter((l) => l.method === 'PUT')).toHaveLength(2);
+    expect(out).toContain('2 transactions');
+  });
+});
+
+describe('transaction edit (bulk) failure handling', () => {
+  test('reports failures and sets a non-zero exit code', async () => {
+    const prevExit = process.exitCode;
+    process.exitCode = 0;
+    // Specific 500 route must precede the generic success route.
+    const log = stub({
+      'PUT /v1/transactions/102': { status: 500, body: { message: 'boom' } },
+      'PUT /v1/transactions/': { body: { data: group() } },
+    });
+    const out = await run(['tx', 'edit', '101', '102', '--category', 'Food', '--yes']);
+    expect(log.filter((l) => l.method === 'PUT').length).toBeGreaterThanOrEqual(2);
+    expect(out).toContain('1 transactions, 1 failed');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = prevExit;
+  });
+});

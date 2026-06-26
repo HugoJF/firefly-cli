@@ -20,10 +20,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { parse as parseYaml, stringify as toYaml } from 'yaml';
+import type { FireflyClient } from '../api/client.ts';
 import { buildUrl } from '../api/client.ts';
 import { CancelledError, UsageError } from '../api/errors.ts';
 import { getContext } from '../context.ts';
 import {
+  formatMoney,
   formatSplitAmount,
   printMutation,
   printResult,
@@ -31,6 +33,9 @@ import {
   renderList,
 } from '../output/render.ts';
 import { type ReferenceKind, pickReference } from '../output/selectors.ts';
+import { mapConcurrent } from '../util/concurrent.ts';
+import { readStdin } from '../util/prompt.ts';
+import { SEARCH_OPERATORS_HELP } from './search.ts';
 
 const TX_TYPES = ['withdrawal', 'deposit', 'transfer'];
 
@@ -102,6 +107,100 @@ const transactionColumns = [
   },
   { header: 'category', get: (t: any) => firstSplit(t).category_name ?? '' },
 ];
+
+/** Group-by dimensions for `tx list --group-by` (client-side roll-up). */
+const GROUP_BY_DIMS = ['category', 'account', 'payee', 'month', 'day-of-week'] as const;
+type GroupByDim = (typeof GROUP_BY_DIMS)[number];
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** Bucket key for a split under the chosen dimension. "payee" = the non-asset side. */
+function groupKey(split: any, dim: GroupByDim): string {
+  switch (dim) {
+    case 'category':
+      return split.category_name || '(uncategorized)';
+    case 'account':
+      return split.source_name || '(unknown)';
+    case 'payee':
+      // For a withdrawal the payee is the destination; for a deposit, the source.
+      return (split.type === 'deposit' ? split.source_name : split.destination_name) || '(unknown)';
+    case 'month':
+      return String(split.date ?? '').slice(0, 7) || '(no date)';
+    case 'day-of-week': {
+      const d = split.date ? new Date(split.date) : null;
+      return d && !Number.isNaN(d.getTime()) ? WEEKDAYS[d.getUTCDay()] : '(no date)';
+    }
+  }
+}
+
+/** Roll transaction groups up by a dimension and render the aggregate table. */
+function renderGroupBy(rows: any[], dim: GroupByDim, opts: any, ctx: any): void {
+  const buckets = new Map<string, { count: number; sum: number; dp: number }>();
+  for (const group of rows) {
+    for (const split of group?.attributes?.transactions ?? []) {
+      const key = groupKey(split, dim);
+      const bucket = buckets.get(key) ?? { count: 0, sum: 0, dp: 2 };
+      bucket.count += 1;
+      const amount = Number(split.amount);
+      if (!Number.isNaN(amount)) {
+        bucket.sum += Math.abs(amount);
+      }
+      if (Number.isFinite(split.currency_decimal_places)) {
+        bucket.dp = split.currency_decimal_places;
+      }
+      buckets.set(key, bucket);
+    }
+  }
+  // Sort by summed amount desc when summing, else by count desc.
+  const entries = [...buckets.entries()].sort((a, b) =>
+    opts.sum ? b[1].sum - a[1].sum : b[1].count - a[1].count,
+  );
+  const columns: Array<{ header: string; get: (e: [string, any]) => string }> = [
+    { header: dim, get: (e) => e[0] },
+    { header: 'count', get: (e) => String(e[1].count) },
+  ];
+  if (opts.sum) {
+    columns.push({
+      header: 'sum',
+      get: (e) => formatMoney(e[1].sum, { decimalPlaces: e[1].dp }),
+    });
+  }
+  renderList(entries, columns, ctx.output);
+}
+
+/** Render a transaction list, or a roll-up when --group-by is set. */
+function emitTransactions(rows: any[], opts: any, ctx: any): void {
+  if (opts.groupBy) {
+    if (!GROUP_BY_DIMS.includes(opts.groupBy)) {
+      throw new UsageError(
+        `Invalid --group-by "${opts.groupBy}".`,
+        `Valid: ${GROUP_BY_DIMS.join(', ')}.`,
+      );
+    }
+    renderGroupBy(rows, opts.groupBy as GroupByDim, opts, ctx);
+    return;
+  }
+  renderList(rows, transactionColumns, ctx.output);
+}
+
+/** Resolve an account name to its id via the search endpoint (exact-ish match). */
+async function resolveAccountId(client: FireflyClient, name: string): Promise<string> {
+  const { data } = await client.getPaged('/search/accounts', {
+    query: { query: name, field: 'name' },
+    limit: 50,
+  });
+  const exact = data.find(
+    (a: any) => (a.attributes?.name ?? '').toLowerCase() === name.toLowerCase(),
+  );
+  const hit = exact ?? data[0];
+  if (!hit?.id) {
+    throw new UsageError(
+      `No account matched name "${name}".`,
+      'Check the name or pass --account <id>.',
+    );
+  }
+  return hit.id;
+}
 
 /** Map a flag value to either an `_id` (numeric) or `_name` field. */
 function refFields(prefix: string, value?: string): Record<string, string> {
@@ -324,6 +423,148 @@ function addWriteFlags(cmd: Command): Command {
     .option('--editor', 'Compose splits in $EDITOR (YAML)');
 }
 
+/** Changed fields only: build one partial split from edit flags. */
+function buildPartialSplit(opts: any): Record<string, unknown> {
+  const split: Record<string, unknown> = {};
+  const set = (k: string, v: unknown) => {
+    if (v !== undefined && v !== '') {
+      split[k] = v;
+    }
+  };
+  set('type', opts.type);
+  set('amount', opts.amount);
+  set('description', opts.description);
+  set('date', toIsoDate(opts.date));
+  set('notes', opts.notes);
+  Object.assign(split, refFields('source', opts.source));
+  Object.assign(split, refFields('destination', opts.destination));
+  Object.assign(split, refFields('category', opts.category));
+  Object.assign(split, refFields('budget', opts.budget));
+  if (opts.tag && opts.tag.length > 0) {
+    split.tags = opts.tag;
+  }
+  return split;
+}
+
+/** Build the PUT body for a single transaction edit (editor / --split / flags). */
+async function buildEditBody(
+  client: FireflyClient,
+  id: string,
+  opts: any,
+): Promise<Record<string, unknown>> {
+  if (opts.editor) {
+    const current = (await client.get(`/transactions/${id}`)).data?.data as any;
+    const seed = toYaml({ transactions: current?.attributes?.transactions ?? [] });
+    return { transactions: splitsFromYaml(openEditor(seed)) };
+  }
+  if (opts.split && opts.split.length > 0) {
+    return { transactions: (opts.split as string[]).map((raw) => parseSplit(raw, {})) };
+  }
+  const split = buildPartialSplit(opts);
+  if (Object.keys(split).length === 0) {
+    throw new UsageError('No fields to update.', 'Pass a field flag, --split, or --editor.');
+  }
+  return { transactions: [split] };
+}
+
+/** Resolve the id set for an edit: explicit ids, a --where query, or --stdin. */
+async function resolveEditTargets(
+  client: FireflyClient,
+  ids: string[],
+  opts: any,
+): Promise<string[]> {
+  const chosen = [opts.where && 'where', opts.stdin && 'stdin', ids.length && 'ids'].filter(
+    Boolean,
+  );
+  if (chosen.length > 1) {
+    throw new UsageError('Choose one selection source: ids, --where, or --stdin.');
+  }
+  if (opts.where) {
+    const { data } = await client.getPaged('/search/transactions', {
+      query: { query: opts.where },
+      all: true,
+    });
+    return data.map((t: any) => t.id).filter(Boolean);
+  }
+  if (opts.stdin) {
+    const text = await readStdin();
+    return text
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return ids;
+}
+
+/** Edit a single split in place: PUT its group with the split keyed by journal id. */
+async function editSingleJournal(
+  client: FireflyClient,
+  ctx: Awaited<ReturnType<typeof getContext>>,
+  journalId: string,
+  opts: any,
+): Promise<void> {
+  const group = (await client.get(`/transaction-journals/${journalId}`)).data?.data as any;
+  const groupId = group?.id;
+  if (!groupId) {
+    throw new UsageError(`Could not resolve the transaction group for journal ${journalId}.`);
+  }
+  const split = buildPartialSplit(opts);
+  if (Object.keys(split).length === 0) {
+    throw new UsageError('No fields to update.', 'Pass a field flag (e.g. --category).');
+  }
+  split.transaction_journal_id = journalId;
+  const res = await client.put(`/transactions/${groupId}`, { transactions: [split] });
+  const item = (res.data?.data ?? res.data) as any;
+  printMutation(ctx.output, {
+    id: journalId,
+    verb: 'Updated split',
+    description: item?.attributes?.group_title ?? '',
+  });
+}
+
+/** Apply one partial split to many transactions with bounded concurrency. */
+async function runBulkEdit(
+  ctx: Awaited<ReturnType<typeof getContext>>,
+  client: FireflyClient,
+  targets: string[],
+  split: Record<string, unknown>,
+  concurrency: number,
+): Promise<void> {
+  const body = { transactions: [split] };
+  if (!(await ctx.confirm(`Update ${targets.length} transactions?`))) {
+    return;
+  }
+  let done = 0;
+  const showProgress = !ctx.output.quiet && process.stderr.isTTY;
+  const results = await mapConcurrent(
+    targets,
+    concurrency,
+    (txId) => client.put(`/transactions/${txId}`, body),
+    () => {
+      done += 1;
+      if (showProgress) {
+        process.stderr.write(`\rupdating… ${done}/${targets.length}`);
+      }
+    },
+  );
+  if (showProgress) {
+    process.stderr.write('\r\x1b[K');
+  }
+  const failed = results.filter((r) => !r.ok);
+  for (const f of failed) {
+    process.stderr.write(`failed #${f.item}: ${(f.error as Error)?.message ?? 'error'}\n`);
+  }
+  printMutation(ctx.output, {
+    verb: 'Updated',
+    description: `${results.length - failed.length} transactions${
+      failed.length ? `, ${failed.length} failed` : ''
+    }`,
+  });
+  if (failed.length > 0) {
+    process.exitCode = 1;
+  }
+}
+
 export function register(program: Command): void {
   const tx = program
     .command('transaction')
@@ -333,23 +574,52 @@ export function register(program: Command): void {
   // ── list ──────────────────────────────────────────────────────────────────
   tx.command('list')
     .description('List transactions')
+    .option('--query <q>', 'Server-side search query (Firefly DSL); see below')
     .option('--type <type>', 'Filter by type (withdrawal|deposit|transfer)')
     .option('--start <date>', 'Start date')
     .option('--end <date>', 'End date')
     .option('--account <id>', 'Scope to an account id')
+    .option('--account-name <name>', 'Scope to an account by name (resolved server-side)')
     .option('--category <id>', 'Scope to a category id')
     .option('--budget <id>', 'Scope to a budget id')
     .option('--tag <tag>', 'Scope to a tag')
     .option('--currency <code>', 'Scope to a currency code')
+    .option(
+      '--group-by <dim>',
+      `Aggregate rows by ${GROUP_BY_DIMS.join('|')} (implies a roll-up table)`,
+    )
+    .option('--sum', 'With --group-by: include a summed amount column')
+    .option('--count', 'With --group-by: include a row count column (on by default)')
     .option('--limit <n>', 'Page size', int)
     .option('--page <n>', 'Page number', int)
     .option('--all', 'Fetch every page')
+    .addHelpText('after', SEARCH_OPERATORS_HELP)
     .action(async (opts, command: Command) => {
       const ctx = await getContext(command);
       const client = await ctx.client();
+
+      // --query routes to the search endpoint so `list` and `search` aren't a
+      // cliff edge ("list has flags, search has a secret language").
+      if (opts.query) {
+        const { data } = await client.getPaged('/search/transactions', {
+          query: { query: opts.query },
+          limit: opts.limit,
+          page: opts.page,
+          all: opts.all,
+        });
+        emitTransactions(data, opts, ctx);
+        return;
+      }
+
+      // Resolve --account-name → id (an extra hop the agent usually skipped).
+      let accountId = opts.account;
+      if (!accountId && opts.accountName) {
+        accountId = await resolveAccountId(client, opts.accountName);
+      }
+
       let path = '/transactions';
-      if (opts.account) {
-        path = `/accounts/${opts.account}/transactions`;
+      if (accountId) {
+        path = `/accounts/${accountId}/transactions`;
       } else if (opts.category) {
         path = `/categories/${opts.category}/transactions`;
       } else if (opts.budget) {
@@ -359,13 +629,25 @@ export function register(program: Command): void {
       } else if (opts.currency) {
         path = `/currencies/${opts.currency}/transactions`;
       }
+
+      // Nudge away from "dump the whole DB and filter in jq" when --all is used
+      // with no server-side narrowing at all.
+      const noFilter =
+        !opts.type && !accountId && !opts.category && !opts.budget && !opts.tag && !opts.currency;
+      if (opts.all && noFilter && !opts.groupBy && !ctx.output.quiet) {
+        process.stderr.write(
+          "tip: server-side filtering available via 'firefly search transactions <query>' " +
+            "(see 'firefly tx list --help')\n",
+        );
+      }
+
       const { data } = await client.getPaged(path, {
         query: { type: opts.type, start: toIsoDate(opts.start), end: toIsoDate(opts.end) },
         limit: opts.limit,
         page: opts.page,
         all: opts.all,
       });
-      renderList(data, transactionColumns, ctx.output);
+      emitTransactions(data, opts, ctx);
     });
 
   // ── view ──────────────────────────────────────────────────────────────────
@@ -433,54 +715,86 @@ export function register(program: Command): void {
 
   // ── edit ──────────────────────────────────────────────────────────────────
   addWriteFlags(
-    tx.command('edit').description('Update a transaction').argument('<id>', 'Transaction id'),
-  ).action(async (id: string, opts, command: Command) => {
-    const ctx = await getContext(command);
-    const client = await ctx.client();
+    tx
+      .command('edit')
+      .description('Update one or many transactions (ids, --stdin, or --where)')
+      .argument('[ids...]', 'Transaction id(s); omit when using --where or --stdin'),
+  )
+    .option('--journal', 'Treat a single id as a transaction-journal (one split) and edit just it')
+    .option('--where <query>', 'Select transactions to edit by search query (Firefly DSL)')
+    .option('--stdin', 'Read transaction ids from stdin (whitespace/newline separated)')
+    .option('--concurrency <n>', 'Max parallel updates for bulk edits (default 8)', int)
+    .addHelpText('after', SEARCH_OPERATORS_HELP)
+    .action(async (ids: string[], opts, command: Command) => {
+      const ctx = await getContext(command);
+      const client = await ctx.client();
 
-    let body: Record<string, unknown>;
-    if (opts.editor) {
-      const current = (await client.get(`/transactions/${id}`)).data?.data as any;
-      const seed = toYaml({ transactions: current?.attributes?.transactions ?? [] });
-      body = { transactions: splitsFromYaml(openEditor(seed)) };
-    } else {
-      // Changed fields only: build one partial split from provided flags.
-      const split: Record<string, unknown> = {};
-      const set = (k: string, v: unknown) => {
-        if (v !== undefined && v !== '') {
-          split[k] = v;
-        }
-      };
-      set('type', opts.type);
-      set('amount', opts.amount);
-      set('description', opts.description);
-      set('date', toIsoDate(opts.date));
-      set('notes', opts.notes);
-      Object.assign(split, refFields('source', opts.source));
-      Object.assign(split, refFields('destination', opts.destination));
-      Object.assign(split, refFields('category', opts.category));
-      Object.assign(split, refFields('budget', opts.budget));
-      if (opts.tag && opts.tag.length > 0) {
-        split.tags = opts.tag;
+      // Resolve the target id set: explicit ids, --where query, or --stdin.
+      const targets = await resolveEditTargets(client, ids, opts);
+      if (targets.length === 0) {
+        throw new UsageError(
+          'No transactions to edit.',
+          'Pass an id, --where <query>, or --stdin.',
+        );
       }
-      if (opts.split && opts.split.length > 0) {
-        body = { transactions: (opts.split as string[]).map((raw) => parseSplit(raw, {})) };
-      } else {
-        if (Object.keys(split).length === 0) {
-          throw new UsageError('No fields to update.', 'Pass a field flag, --split, or --editor.');
-        }
-        body = { transactions: [split] };
-      }
-    }
 
-    const res = await client.put(`/transactions/${id}`, body);
-    const item = (res.data?.data ?? res.data) as any;
-    printMutation(ctx.output, {
-      id: item?.id ?? id,
-      verb: 'Updated transaction',
-      description: item?.attributes?.group_title ?? firstSplit(item).description ?? '',
+      // Per-split edit: PUT the parent group with the split keyed by its journal id.
+      if (opts.journal) {
+        if (targets.length !== 1) {
+          throw new UsageError('--journal edits exactly one journal id.');
+        }
+        await editSingleJournal(client, ctx, targets[0], opts);
+        return;
+      }
+
+      // Single explicit target: keep the original single-edit UX (editor support,
+      // returns the updated description).
+      if (targets.length === 1 && !opts.where && !opts.stdin) {
+        const body = await buildEditBody(client, targets[0], opts);
+        const res = await client.put(`/transactions/${targets[0]}`, body);
+        const item = (res.data?.data ?? res.data) as any;
+        printMutation(ctx.output, {
+          id: item?.id ?? targets[0],
+          verb: 'Updated transaction',
+          description: item?.attributes?.group_title ?? firstSplit(item).description ?? '',
+        });
+        return;
+      }
+
+      // Bulk: --editor is single-only; otherwise apply one partial split to each.
+      if (opts.editor) {
+        throw new UsageError(
+          '--editor cannot be combined with bulk selection (--where/--stdin/multiple ids).',
+        );
+      }
+      const split = buildPartialSplit(opts);
+      if (Object.keys(split).length === 0) {
+        throw new UsageError('No fields to update.', 'Pass a field flag (e.g. --category).');
+      }
+      await runBulkEdit(ctx, client, targets, split, opts.concurrency ?? 8);
     });
-  });
+
+  // ── categorize ──────────────────────────────────────────────────────────────
+  tx.command('categorize')
+    .description('Bulk-set a category on every transaction matching a query')
+    .argument('<query>', 'Search query selecting the transactions (Firefly DSL)')
+    .argument('<category>', 'Category to set (id or name)')
+    .option('--concurrency <n>', 'Max parallel updates (default 8)', int)
+    .addHelpText('after', SEARCH_OPERATORS_HELP)
+    .action(async (query: string, category: string, opts, command: Command) => {
+      const ctx = await getContext(command);
+      const client = await ctx.client();
+      const { data } = await client.getPaged('/search/transactions', {
+        query: { query },
+        all: true,
+      });
+      const targets = data.map((t: any) => t.id).filter(Boolean);
+      if (targets.length === 0) {
+        throw new UsageError(`No transactions matched query: ${query}`);
+      }
+      const split = { ...refFields('category', category) };
+      await runBulkEdit(ctx, client, targets, split, opts.concurrency ?? 8);
+    });
 
   // ── delete ────────────────────────────────────────────────────────────────
   tx.command('delete')

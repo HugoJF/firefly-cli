@@ -149,3 +149,53 @@ describe('account transactions', () => {
     expect(log[0].url).toContain('end=2026-02-01');
   });
 });
+
+describe('account spend', () => {
+  const motelGroup = (amount: string, date: string) => ({
+    id: '1',
+    attributes: {
+      transactions: [
+        { type: 'withdrawal', amount, date, currency_symbol: '$', currency_decimal_places: 2 },
+      ],
+    },
+  });
+
+  test('resolves a name then aggregates count/sum/avg', async () => {
+    const log = stub({
+      'GET /v1/search/accounts': {
+        body: { data: [{ id: '38', attributes: { name: 'Estrelas Motel' } }] },
+      },
+      'GET /v1/accounts/38/transactions': {
+        body: {
+          data: [motelGroup('100', '2025-01-01'), motelGroup('50', '2025-02-01')],
+        },
+      },
+    });
+    const out = await run(['account', 'spend', 'Estrelas Motel']);
+    expect(log[0].url).toContain('/v1/search/accounts');
+    expect(log[1].url).toContain('/v1/accounts/38/transactions');
+    expect(out).toMatch(/total\s+2\s+150\.00\s+75\.00/);
+  });
+
+  test('--by year buckets the spend', async () => {
+    stub({
+      'GET /v1/search/accounts': {
+        body: { data: [{ id: '38', attributes: { name: 'Motel' } }] },
+      },
+      'GET /v1/accounts/38/transactions': {
+        body: { data: [motelGroup('100', '2024-06-01'), motelGroup('40', '2025-06-01')] },
+      },
+    });
+    const out = await run(['account', 'spend', 'Motel', '--by', 'year']);
+    expect(out).toMatch(/2024\s+1\s+100\.00/);
+    expect(out).toMatch(/2025\s+1\s+40\.00/);
+  });
+
+  test('a numeric argument skips name resolution', async () => {
+    const log = stub({
+      'GET /v1/accounts/7/transactions': { body: { data: [] } },
+    });
+    await run(['account', 'spend', '7']);
+    expect(log[0].url).toContain('/v1/accounts/7/transactions');
+  });
+});

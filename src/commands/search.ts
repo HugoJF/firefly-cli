@@ -15,6 +15,28 @@ function intArg(v: string): number {
   return Number.parseInt(v, 10);
 }
 
+/**
+ * Cheatsheet for Firefly III's transaction search DSL. Surfaced in
+ * `search transactions --help` and `tx list --query --help` so the query
+ * language is discoverable (it is otherwise invisible). See
+ * https://docs.firefly-iii.org/how-to/firefly-iii/features/search/ for the full
+ * operator set.
+ */
+export const SEARCH_OPERATORS_HELP = `
+Query operators (Firefly III search language — combine with spaces = AND):
+  has_no_category:true        category_is:"Food"            budget_is:"Bills"
+  has_any_tag:true            tag_is:"Trip"                 notes_contain:"text"
+  amount_more:100             amount_less:50                amount_is:42
+  description_contains:"Eden Beer"                          description_is:"Exact"
+  date_after:2026-01-01       date_before:2026-12-31        date_on:2026-06-01
+  source_account_is:"Checking"            destination_account_is:"Estrelas Motel"
+  type:withdrawal             currency_is:EUR
+
+Examples:
+  firefly search transactions 'has_no_category:true date_after:2026-01-01'
+  firefly search transactions 'category_is:"Food" amount_more:100'
+  firefly search transactions 'description_contains:"Eden Beer"'`;
+
 export function register(program: Command): void {
   const search = program.command('search').description('Search transactions and accounts');
 
@@ -22,6 +44,7 @@ export function register(program: Command): void {
     .command('transactions')
     .description('Search transactions (GET /search/transactions)')
     .argument('<query>', 'Firefly search query, e.g. "amount_more:100 category_is:Food"')
+    .addHelpText('after', SEARCH_OPERATORS_HELP)
     .option('--limit <n>', 'Page size', intArg)
     .option('--page <n>', 'Page number', intArg)
     .option('--all', 'Fetch every page')

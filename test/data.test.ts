@@ -54,3 +54,64 @@ describe('data destroy guard', () => {
     expect(del?.url).toContain('objects=budgets');
   });
 });
+
+describe('data bulk (structured)', () => {
+  test('--where/--set assembles a where+update JSON query', async () => {
+    const { requests } = await runCommand(
+      register,
+      ['data', 'bulk', '--where', 'category_id=1', '--set', 'category_id=5'],
+      { 'POST /data/bulk/transactions': { status: 204 } },
+    );
+    expect(requests[0].method).toBe('POST');
+    const url = new URL(requests[0].url);
+    expect(JSON.parse(url.searchParams.get('query') as string)).toEqual({
+      where: { category_id: '1' },
+      update: { category_id: '5' },
+    });
+  });
+
+  test('errors when nothing to set', async () => {
+    await expect(
+      runCommand(register, ['data', 'bulk', '--where', 'category_id=1']),
+    ).rejects.toThrow(/Nothing to update/);
+  });
+
+  test('raw --query passes through', async () => {
+    const { requests } = await runCommand(
+      register,
+      ['data', 'bulk', '--query', '{"update":{"category_id":"9"}}'],
+      { 'POST /data/bulk/transactions': { status: 204 } },
+    );
+    const url = new URL(requests[0].url);
+    expect(url.searchParams.get('query')).toBe('{"update":{"category_id":"9"}}');
+  });
+});
+
+describe('data export --format', () => {
+  test('json pulls the list endpoint and serializes', async () => {
+    const { stdout, requests } = await runCommand(
+      register,
+      ['data', 'export', 'transactions', '--format', 'json'],
+      { 'GET /v1/transactions': { body: { data: [{ id: '1' }, { id: '2' }] } } },
+    );
+    expect(requests[0].url).toContain('/v1/transactions');
+    expect(JSON.parse(stdout)).toHaveLength(2);
+  });
+
+  test('ndjson emits one object per line', async () => {
+    const { stdout } = await runCommand(
+      register,
+      ['data', 'export', 'transactions', '--format', 'ndjson'],
+      { 'GET /v1/transactions': { body: { data: [{ id: '1' }, { id: '2' }] } } },
+    );
+    const lines = stdout.trim().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]).id).toBe('1');
+  });
+
+  test('rejects an invalid format', async () => {
+    await expect(
+      runCommand(register, ['data', 'export', 'transactions', '--format', 'xml']),
+    ).rejects.toThrow(/Invalid --format/);
+  });
+});
